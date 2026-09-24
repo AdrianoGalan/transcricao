@@ -25,13 +25,22 @@ Trade-off real de modelo (CPU, sem GPU CUDA):
     large-v3   -> melhor qualidade, impraticável em CPU para vídeos longos
 Com GPU NVIDIA (CUDA), 'medium' ou 'large-v3' ficam viáveis mesmo para
 vídeos de 1h+.
+
+Log:
+    Tudo é registrado em transcricao.log, na pasta raiz do projeto (mesmo
+    diretório de onde o script é executado), além de aparecer no terminal
+    enquanto a sessão estiver conectada. Se o processo morrer sem você
+    estar olhando o terminal (sessão SSH caiu, PC desligou, etc.), o log
+    em arquivo é a única fonte de verdade sobre o que aconteceu.
 """
 
 import argparse
 import atexit
+import logging
 import os
 import signal
 import sys
+import traceback
 from pathlib import Path
 
 import psutil
@@ -44,26 +53,48 @@ from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.enums import TA_JUSTIFY
 
+LOG_PATH = Path(__file__).resolve().parent / "transcricao.log"
+
+logger = logging.getLogger("youtube_transcribe_pdf")
+logger.setLevel(logging.DEBUG)
+
+_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+_file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(_formatter)
+logger.addHandler(_file_handler)
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_formatter)
+logger.addHandler(_console_handler)
+
 
 def matar_processos_filhos() -> None:
     """Mata recursivamente todo processo filho do script atual (ex.: ffmpeg
     disparado pelo yt-dlp). Chamado ao interromper (Ctrl+C) ou ao sair por
-    qualquer motivo, pra não deixar nada órfão consumindo CPU/rede em segundo
-    plano — foi exatamente isso que aconteceu nas execuções anteriores.
+    qualquer motivo, pra não deixar nada órfão consumindo CPU/rede em
+    segundo plano.
     """
     try:
         proc_atual = psutil.Process(os.getpid())
     except psutil.NoSuchProcess:
         return
-    for filho in proc_atual.children(recursive=True):
+    filhos = proc_atual.children(recursive=True)
+    for filho in filhos:
         try:
             filho.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    if filhos:
+        logger.info("Processos filhos encerrados: %s", [f.pid for f in filhos])
 
 
 def _handler_interrupcao(sig, frame):
-    print("\n[info] Interrompido pelo usuário (Ctrl+C). Encerrando processos filhos...")
+    logger.warning("Interrompido pelo usuário (sinal %s). Encerrando processos filhos...", sig)
     matar_processos_filhos()
     sys.exit(130)
 
@@ -91,11 +122,12 @@ def baixar_audio(url: str, destino_dir: Path) -> tuple[Path, dict]:
     """
     destino_dir.mkdir(parents=True, exist_ok=True)
 
+    logger.info("Buscando metadados do vídeo...")
     info = obter_info_video(url)
     caminho_audio = destino_dir / f"{info['id']}.mp3"
 
     if caminho_audio.exists():
-        print(f"[info] Áudio já existe em {caminho_audio}, pulando download.")
+        logger.info("Áudio já existe em %s, pulando download.", caminho_audio)
         return caminho_audio, info
 
     template_saida = str(destino_dir / "%(id)s.%(ext)s")
@@ -109,10 +141,12 @@ def baixar_audio(url: str, destino_dir: Path) -> tuple[Path, dict]:
                 "preferredquality": "192",
             }
         ],
-        "quiet": False,
-        "no_warnings": False,
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _YtDlpLoggerAdapter(),
     }
 
+    logger.info("Baixando áudio de: %s", url)
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
@@ -121,7 +155,29 @@ def baixar_audio(url: str, destino_dir: Path) -> tuple[Path, dict]:
             f"Download concluído mas arquivo esperado não encontrado: {caminho_audio}"
         )
 
+    logger.info("Áudio salvo em: %s (%.1f MB)", caminho_audio, caminho_audio.stat().st_size / 1_048_576)
     return caminho_audio, info
+
+
+class _YtDlpLoggerAdapter:
+    """Redireciona as mensagens internas do yt-dlp para o logger do script,
+    em vez de imprimir direto no stdout — assim elas também vão para o
+    arquivo de log."""
+
+    def debug(self, msg):
+        if msg.startswith("[debug] "):
+            logger.debug(msg)
+        else:
+            logger.info(msg)
+
+    def info(self, msg):
+        logger.info(msg)
+
+    def warning(self, msg):
+        logger.warning(msg)
+
+    def error(self, msg):
+        logger.error(msg)
 
 
 def transcrever_audio(
@@ -134,14 +190,15 @@ def transcrever_audio(
     Transcreve o áudio usando faster-whisper.
     Retorna lista de segmentos com start, end e text.
 
-    Progresso: a barra avança conforme o timestamp de fim de cada segmento
-    processado, comparado à duração total do áudio (info.duration). Não é
-    um "tempo restante" exato — é proporção de áudio já processada — mas é
-    a métrica real disponível, já que o whisper não expõe % de conclusão
-    diretamente.
+    Progresso: a barra no terminal avança conforme o timestamp de fim de
+    cada segmento processado, comparado à duração total do áudio
+    (info.duration). Além da barra, marcos de progresso (a cada 10%) são
+    gravados no log em arquivo — a barra em si não vai para o log, porque
+    é uma linha só sendo reescrita, não uma sequência de eventos.
     """
+    logger.info("Carregando modelo '%s' (CPU, int8)...", modelo)
     model = WhisperModel(modelo, device="cpu", compute_type="int8")
-    print(f"[info] Rodando modelo '{modelo}' em CPU (int8).")
+    logger.info("Modelo '%s' carregado.", modelo)
 
     segmentos_iter, info = model.transcribe(
         str(caminho_audio),
@@ -149,14 +206,15 @@ def transcrever_audio(
         vad_filter=True,  # remove silêncio/ruído, reduz alucinação do modelo
     )
 
-    print(
-        f"[info] Idioma detectado: {info.language} "
-        f"(confiança: {info.language_probability:.2f})"
+    logger.info(
+        "Idioma detectado: %s (confiança: %.2f)", info.language, info.language_probability
     )
-    print(f"[info] Duração do áudio: {formatar_timestamp(info.duration)}")
+    logger.info("Duração do áudio: %s", formatar_timestamp(info.duration))
 
     segmentos = []
     tempo_processado = 0.0
+    ultimo_marco_logado = -1
+
     with tqdm(
         total=info.duration,
         unit="s",
@@ -169,11 +227,25 @@ def transcrever_audio(
             )
             if verbose:
                 tqdm.write(f"  [{seg.start:7.1f}s -> {seg.end:7.1f}s] {seg.text.strip()}")
+
             avanco = seg.end - tempo_processado
             if avanco > 0:
                 barra.update(avanco)
                 tempo_processado = seg.end
 
+            # Marco de progresso no log (a cada 10%), independente do terminal.
+            if info.duration > 0:
+                marco_atual = int((tempo_processado / info.duration) * 10)
+                if marco_atual > ultimo_marco_logado:
+                    ultimo_marco_logado = marco_atual
+                    logger.info(
+                        "Progresso da transcrição: %d%% (%.0f/%.0fs)",
+                        marco_atual * 10,
+                        tempo_processado,
+                        info.duration,
+                    )
+
+    logger.info("Transcrição concluída: %d segmentos.", len(segmentos))
     return segmentos
 
 
@@ -192,6 +264,8 @@ def gerar_pdf(
     incluir_timestamps: bool = True,
 ) -> None:
     """Gera um PDF com a transcrição usando reportlab (Platypus)."""
+    caminho_saida.parent.mkdir(parents=True, exist_ok=True)
+
     doc = SimpleDocTemplate(
         str(caminho_saida),
         pagesize=A4,
@@ -233,7 +307,9 @@ def gerar_pdf(
         )
         story.append(Paragraph(texto_seguro, estilo_corpo))
 
+    logger.info("Gravando PDF em: %s (%d segmentos)", caminho_saida, len(segmentos))
     doc.build(story)
+    logger.info("PDF gravado com sucesso: %s", caminho_saida.resolve())
 
 
 def main():
@@ -277,41 +353,72 @@ def main():
     idioma = None if args.lang == "auto" else args.lang
     audio_dir = Path(args.audio_dir)
 
-    print("[0/3] Verificando pastas de destino...")
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[info] Pasta de áudio: {audio_dir.resolve()}")
-    if args.output:
-        pasta_saida_pdf = Path(args.output).parent
-        pasta_saida_pdf.mkdir(parents=True, exist_ok=True)
-        print(f"[info] Pasta de saída do PDF: {pasta_saida_pdf.resolve()}")
+    logger.info("========== Nova execução ==========")
+    logger.info("URL: %s", args.url)
+    logger.info("Args: model=%s lang=%s output=%s audio_dir=%s", args.model, args.lang, args.output, args.audio_dir)
 
-    print("[1/3] Baixando áudio...")
-    caminho_audio, info = baixar_audio(args.url, audio_dir)
-    titulo_video = info.get("title", "video")
-    print(f"[info] Áudio salvo em: {caminho_audio.resolve()}")
-
-    print("[2/3] Transcrevendo (isso pode demorar dependendo do modelo/hardware)...")
-    segmentos = transcrever_audio(
-        caminho_audio, modelo=args.model, idioma=idioma, verbose=args.verbose
-    )
-
-    if not segmentos:
-        print("[erro] Nenhum segmento de fala foi detectado. Abortando.", file=sys.stderr)
+    logger.info("[0/3] Verificando pastas de destino...")
+    try:
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Pasta de áudio: %s", audio_dir.resolve())
+        if args.output:
+            pasta_saida_pdf = Path(args.output).parent
+            pasta_saida_pdf.mkdir(parents=True, exist_ok=True)
+            logger.info("Pasta de saída do PDF: %s", pasta_saida_pdf.resolve())
+    except OSError:
+        logger.exception("Falha ao criar pastas de destino.")
         sys.exit(1)
 
-    print("[3/3] Gerando PDF...")
+    logger.info("[1/3] Baixando áudio...")
+    try:
+        caminho_audio, info = baixar_audio(args.url, audio_dir)
+    except Exception:
+        logger.exception("Falha no download/extração do áudio.")
+        sys.exit(1)
+
+    titulo_video = info.get("title", "video")
+
+    logger.info("[2/3] Transcrevendo (isso pode demorar dependendo do modelo/hardware)...")
+    try:
+        segmentos = transcrever_audio(
+            caminho_audio, modelo=args.model, idioma=idioma, verbose=args.verbose
+        )
+    except Exception:
+        logger.exception("Falha durante a transcrição.")
+        sys.exit(1)
+
+    if not segmentos:
+        logger.error("Nenhum segmento de fala foi detectado. Abortando.")
+        sys.exit(1)
+
+    logger.info("[3/3] Gerando PDF...")
     nome_saida = args.output or f"{titulo_video[:80]}.pdf".replace("/", "-")
     caminho_saida = Path(nome_saida)
-    gerar_pdf(
-        segmentos,
-        titulo=titulo_video,
-        url_origem=args.url,
-        caminho_saida=caminho_saida,
-        incluir_timestamps=not args.no_timestamps,
-    )
+    try:
+        gerar_pdf(
+            segmentos,
+            titulo=titulo_video,
+            url_origem=args.url,
+            caminho_saida=caminho_saida,
+            incluir_timestamps=not args.no_timestamps,
+        )
+    except Exception:
+        logger.exception("Falha ao gerar o PDF.")
+        sys.exit(1)
 
-    print(f"\nConcluído: {caminho_saida.resolve()}")
+    logger.info("Concluído: %s", caminho_saida.resolve())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # Rede de segurança final: qualquer exceção que escapou dos blocos
+        # try/except específicos de cada etapa (bug não previsto, erro de
+        # biblioteca externa, etc.) é registrada aqui antes do processo
+        # morrer. Sem isso, um crash inesperado não deixa rastro nenhum —
+        # foi exatamente o problema relatado antes desta versão existir.
+        logger.critical("Erro não tratado, script encerrado abruptamente:\n%s", traceback.format_exc())
+        sys.exit(1)
