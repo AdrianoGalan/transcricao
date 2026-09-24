@@ -1,5 +1,6 @@
 # Ambiente virtual
 .venv/
+venv/
 
 # Áudios baixados
 audios/
