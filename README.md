@@ -27,19 +27,20 @@ pip install yt-dlp faster-whisper reportlab tqdm psutil
 
 ## Uso
 
+**Direto (processo preso ao terminal):**
 ```bash
 python youtube_transcribe_pdf.py "https://youtube.com/watch?v=XXXX"
 ```
 
-Com opções:
-
+**Em segundo plano (sobrevive a fechar o terminal / queda de SSH):**
 ```bash
-python youtube_transcribe_pdf.py "URL" \
-  --model medium \
-  --lang pt \
-  --output saida.pdf \
-  --audio-dir audios \
-  --verbose
+chmod +x transcrever.sh   # só na primeira vez
+./transcrever.sh "https://youtube.com/watch?v=XXXX"
+```
+`transcrever.sh` repassa todos os parâmetros direto pro script Python, então
+qualquer opção da tabela abaixo funciona igual em ambas as formas:
+```bash
+./transcrever.sh "URL" --model medium --lang pt --output saida.pdf
 ```
 
 | Opção             | Padrão    | Descrição                                                        |
@@ -59,7 +60,35 @@ python youtube_transcribe_pdf.py "URL" \
 4. **Gera o PDF** com `reportlab`, um parágrafo por segmento de fala.
 
 Ctrl+C durante qualquer etapa mata o processo e todos os filhos (ex.: `ffmpeg`)
-de forma limpa — nada fica rodando em segundo plano.
+de forma limpa — nada fica rodando em segundo plano sem você saber.
+
+## Log
+
+Tudo é registrado em `transcricao.log`, na raiz do projeto, com timestamp e
+nível — além de aparecer no terminal enquanto a sessão estiver conectada.
+Qualquer falha (download, transcrição, geração do PDF, ou erro não previsto)
+é gravada com traceback completo, então mesmo rodando em segundo plano sem
+ninguém olhando dá pra saber depois exatamente o que aconteceu e em qual
+etapa.
+
+Ao rodar via `./transcrever.sh`, existe um segundo arquivo,
+`transcricao_stdout.log`, que captura a saída bruta do processo (stdout/
+stderr) — cobre erros que acontecem antes do logging ser inicializado, como
+dependência faltando ou ambiente virtual quebrado.
+
+```bash
+tail -f transcricao.log            # acompanhar progresso/erros ao vivo
+ps -p <PID>                        # confirmar se o processo ainda está rodando
+```
+
+**Limite conhecido**: se o processo for morto pelo OOM killer do kernel (falta
+de memória RAM), nem o log estruturado nem o stdout capturam nada — o
+processo não tem chance de escrever antes de morrer. Nesse caso, a evidência
+fica nos logs do sistema:
+```bash
+dmesg -T | grep -i "killed process"
+journalctl -k | grep -i "out of memory"
+```
 
 ## Performance (sem GPU)
 
@@ -81,9 +110,12 @@ de 1h+. Este script não detecta GPU automaticamente — está fixo em CPU
 ```
 .
 ├── youtube_transcribe_pdf.py
-├── audios/          # áudios baixados (não versionado)
-├── .venv/           # ambiente virtual (não versionado)
-└── *.pdf            # transcrições geradas (não versionado)
+├── transcrever.sh          # roda o script acima em segundo plano
+├── transcricao.log         # log estruturado (não versionado)
+├── transcricao_stdout.log  # saída bruta ao rodar via transcrever.sh (não versionado)
+├── audios/                 # áudios baixados (não versionado)
+├── .venv/                  # ambiente virtual (não versionado)
+└── *.pdf                   # transcrições geradas (não versionado)
 ```
 
 ## Limitações conhecidas
@@ -93,6 +125,8 @@ de 1h+. Este script não detecta GPU automaticamente — está fixo em CPU
   mudanças do YouTube — extrações podem quebrar sem aviso.
 - Sem checkpoint de progresso: se o processo for interrompido no meio da
   transcrição, o trabalho feito até ali é perdido (o áudio baixado, não).
+- Log em arquivo não protege contra `SIGKILL` externo (OOM killer) — ver
+  seção "Log" acima.
 
 ## Licença de uso
 

@@ -14,3 +14,7 @@ __pycache__/
 
 # Configs locais / segredos, se algum dia existir
 .env
+
+# Logs de execução
+transcricao.log
+transcricao_stdout.log
