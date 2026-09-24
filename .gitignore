@@ -1,0 +1,15 @@
+# Ambiente virtual
+.venv/
+
+# Áudios baixados
+audios/
+
+# PDFs de transcrição gerados
+*.pdf
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Configs locais / segredos, se algum dia existir
+.env
